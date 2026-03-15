@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="2026.03.15.3"
+SCRIPT_VERSION="2026.03.15.4"
 
 WARP_DIR="/etc/wireguard"
 WARP_CONF="$WARP_DIR/warp.conf"
