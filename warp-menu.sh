@@ -7,6 +7,8 @@ SCRIPT_VERSION="2026.03.15.3"
 WARP_DIR="/etc/wireguard"
 WARP_CONF="$WARP_DIR/warp.conf"
 WARP_ACCOUNT="$WARP_DIR/warp-account.conf"
+WARP_GO_DIR="/opt/warp-go"
+WARP_GO_CONF="$WARP_GO_DIR/warp.conf"
 GAI_CONF="/etc/gai.conf"
 DANTED_CONF="/etc/danted.conf"
 TINYPROXY_CONF="/etc/tinyproxy/tinyproxy.conf"
@@ -37,6 +39,10 @@ info() {
   echo
 }
 
+is_aliyun_ecs() {
+  grep -qi 'Alibaba Cloud' /sys/class/dmi/id/product_name /sys/class/dmi/id/sys_vendor 2>/dev/null
+}
+
 write_static_resolv_conf() {
   rm -f "$RESOLV_CONF"
   : > "$RESOLV_CONF"
@@ -62,6 +68,7 @@ prepare_safe_rollback() {
 
   if [[ -f "$WARP_CONF" ]]; then cp -a "$WARP_CONF" "$SAFETY_DIR/warp.conf.bak"; fi
   if [[ -f "$WARP_ACCOUNT" ]]; then cp -a "$WARP_ACCOUNT" "$SAFETY_DIR/warp-account.conf.bak"; fi
+  if [[ -d "$WARP_GO_DIR" ]]; then cp -a "$WARP_GO_DIR" "$SAFETY_DIR/warp-go-dir.bak"; fi
   if [[ -f "$GAI_CONF" ]]; then cp -a "$GAI_CONF" "$SAFETY_DIR/gai.conf.bak"; fi
   if [[ -L "$RESOLV_CONF" ]]; then
     printf 'symlink:%s\n' "$(readlink "$RESOLV_CONF")" > "$SAFETY_DIR/resolv.mode"
@@ -73,9 +80,11 @@ prepare_safe_rollback() {
 #!/usr/bin/env bash
 set -euo pipefail
 systemctl disable --now wg-quick@warp >/dev/null 2>&1 || true
+systemctl disable --now warp-go >/dev/null 2>&1 || true
 systemctl stop danted tinyproxy >/dev/null 2>&1 || true
 if [[ -f "$SAFETY_DIR/warp.conf.bak" ]]; then cp -af "$SAFETY_DIR/warp.conf.bak" "$WARP_CONF"; else rm -f "$WARP_CONF"; fi
 if [[ -f "$SAFETY_DIR/warp-account.conf.bak" ]]; then cp -af "$SAFETY_DIR/warp-account.conf.bak" "$WARP_ACCOUNT"; else rm -f "$WARP_ACCOUNT"; fi
+if [[ -d "$SAFETY_DIR/warp-go-dir.bak" ]]; then rm -rf "$WARP_GO_DIR"; cp -af "$SAFETY_DIR/warp-go-dir.bak" "$WARP_GO_DIR"; else rm -rf "$WARP_GO_DIR"; fi
 if [[ -f "$SAFETY_DIR/gai.conf.bak" ]]; then cp -af "$SAFETY_DIR/gai.conf.bak" "$GAI_CONF"; else sed -i '/^precedence ::ffff:0:0\\/96  100$/d' "$GAI_CONF" 2>/dev/null || true; fi
 if [[ -f "$SAFETY_DIR/resolv.conf.bak" ]]; then cp -af "$SAFETY_DIR/resolv.conf.bak" "$RESOLV_CONF"; fi
 if [[ -f "$SAFETY_DIR/resolv.mode" ]]; then
@@ -84,6 +93,7 @@ if [[ -f "$SAFETY_DIR/resolv.mode" ]]; then
   ln -s "\$target" "$RESOLV_CONF"
 fi
 ip link delete warp >/dev/null 2>&1 || true
+ip link delete WARP >/dev/null 2>&1 || true
 systemctl daemon-reload >/dev/null 2>&1 || true
 EOF
   chmod +x "$ROLLBACK_SCRIPT"
@@ -119,13 +129,27 @@ validate_warp_or_rollback() {
   local attempt
 
   for attempt in 1 2 3 4 5; do
-    if wg show warp >/tmp/warp-menu-wg.txt 2>/dev/null; then
-      if grep -q 'latest handshake' /tmp/warp-menu-wg.txt; then
+    if is_aliyun_ecs; then
+      systemctl is-active warp-go >/tmp/warp-menu-wg.txt 2>/dev/null || true
+      if grep -q 'active' /tmp/warp-menu-wg.txt; then
         if getent hosts www.cloudflare.com >/tmp/warp-menu-dns.txt 2>/dev/null; then
           if curl -sS --max-time 12 https://www.cloudflare.com/cdn-cgi/trace >/tmp/warp-menu-trace.txt 2>/dev/null; then
             if grep -q 'warp=on' /tmp/warp-menu-trace.txt; then
               ok=1
               break
+            fi
+          fi
+        fi
+      fi
+    else
+      if wg show warp >/tmp/warp-menu-wg.txt 2>/dev/null; then
+        if grep -q 'latest handshake' /tmp/warp-menu-wg.txt; then
+          if getent hosts www.cloudflare.com >/tmp/warp-menu-dns.txt 2>/dev/null; then
+            if curl -sS --max-time 12 https://www.cloudflare.com/cdn-cgi/trace >/tmp/warp-menu-trace.txt 2>/dev/null; then
+              if grep -q 'warp=on' /tmp/warp-menu-trace.txt; then
+                ok=1
+                break
+              fi
             fi
           fi
         fi
@@ -170,14 +194,12 @@ ensure_base_packages() {
 
 cleanup_old_warp() {
   systemctl disable --now wg-quick@warp >/dev/null 2>&1 || true
+  systemctl disable --now warp-go >/dev/null 2>&1 || true
   rm -f "$WARP_CONF" "$WARP_ACCOUNT"
+  rm -rf "$WARP_GO_DIR"
 }
 
-install_warp_dualstack() {
-  require_root
-  prepare_safe_rollback
-  ensure_base_packages
-  cleanup_old_warp
+install_warp_dualstack_standard() {
   mkdir -p "$WARP_DIR"
 
   python3 <<'PY'
@@ -302,11 +324,43 @@ PY
   show_pending_rollback_notice
 }
 
+install_warp_dualstack_aliyun() {
+  mkdir -p "$WARP_GO_DIR"
+  printf 'C\n' > "$WARP_GO_DIR/language"
+  curl -fsSL https://gitlab.com/fscarmen/warp/-/raw/main/warp-go.sh -o /tmp/warp-go.sh
+  chmod +x /tmp/warp-go.sh
+  printf '2\n' | bash /tmp/warp-go.sh d >/tmp/warp-menu-aliyun-install.log 2>&1 || {
+    cat /tmp/warp-menu-aliyun-install.log || true
+    rollback_now
+    return 1
+  }
+  write_static_resolv_conf
+  validate_warp_or_rollback
+  info "阿里云模式 WARP 双栈安装完成"
+  show_pending_rollback_notice
+}
+
+install_warp_dualstack() {
+  require_root
+  prepare_safe_rollback
+  ensure_base_packages
+  cleanup_old_warp
+  if is_aliyun_ecs; then
+    install_warp_dualstack_aliyun
+  else
+    install_warp_dualstack_standard
+  fi
+}
+
 start_warp() {
   require_root
   prepare_safe_rollback
   write_static_resolv_conf
-  systemctl enable --now wg-quick@warp
+  if is_aliyun_ecs; then
+    systemctl enable --now warp-go
+  else
+    systemctl enable --now wg-quick@warp
+  fi
   validate_warp_or_rollback
   info "WARP 已启动"
   show_pending_rollback_notice
@@ -314,13 +368,21 @@ start_warp() {
 
 stop_warp() {
   require_root
-  systemctl disable --now wg-quick@warp || true
+  if is_aliyun_ecs; then
+    systemctl disable --now warp-go || true
+  else
+    systemctl disable --now wg-quick@warp || true
+  fi
   info "WARP 已停止"
 }
 
 restart_warp() {
   require_root
-  systemctl restart wg-quick@warp
+  if is_aliyun_ecs; then
+    systemctl restart warp-go
+  else
+    systemctl restart wg-quick@warp
+  fi
   info "WARP 已重启"
 }
 
@@ -331,9 +393,14 @@ show_trace() {
 
 show_status() {
   echo
-  systemctl status wg-quick@warp --no-pager -l || true
+  if is_aliyun_ecs; then
+    systemctl status warp-go --no-pager -l || true
+  else
+    systemctl status wg-quick@warp --no-pager -l || true
+  fi
   echo "---"
   wg show warp || true
+  ip addr show WARP 2>/dev/null || true
   echo "---"
   echo "IPv4 Trace:"
   show_trace -4 | sed -n '1,20p'
