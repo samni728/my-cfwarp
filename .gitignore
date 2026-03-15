@@ -1,0 +1,11 @@
+.DS_Store
+.codex-tmp/
+__pycache__/
+*.pyc
+
+whiskeysockets-baileys-7.0.0-rc.9.tgz
+start.sh
+remote-start.sh
+
+.env
+.env.*
